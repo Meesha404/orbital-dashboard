@@ -9,10 +9,12 @@ import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime, timezone, timedelta
 import time
+import random
 
 from data.tle_fetcher import fetch_starlink_tles, parse_tles
 from data.orbital_math import compute_passes, get_current_positions
 from data.cost_model import INFRASTRUCTURE_OPTIONS, compute_cost_latency_tradeoff
+from data.workload_scheduler import generate_job_queue, schedule_jobs, summarize_schedule
 
 
 def render_dark_table(df):
@@ -231,6 +233,21 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
 
+    st.markdown("<div style='border-top:1px solid #0d3320; margin:16px 0;'></div>",
+                unsafe_allow_html=True)
+    st.markdown("""
+    <div style='font-family:Space Mono,monospace; font-size:13px; color:#00ff88;
+                letter-spacing:0.1em; padding:0 0 8px 0;'>
+        ⬡ WORKLOAD QUEUE
+    </div>
+    """, unsafe_allow_html=True)
+    n_jobs = st.slider("JOBS IN QUEUE", 5, 100, 30)
+    job_seed = st.number_input("SEED", min_value=0, max_value=9999, value=42, step=1,
+                                help="Same seed = same job mix, for reproducible demos")
+    if st.button("⟳  REGENERATE JOB QUEUE"):
+        st.session_state['job_seed'] = int(job_seed) + random.randint(1, 9999)
+    effective_seed = st.session_state.get('job_seed', job_seed)
+
     st.markdown("""
     <div style='font-family:Space Mono,monospace; font-size:9px; color:#1d4a2a;
                 margin-top:32px; letter-spacing:0.06em; line-height:1.8;'>
@@ -324,7 +341,8 @@ DARK = dict(
 )
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4 = st.tabs([
+tab5, tab1, tab2, tab3, tab4 = st.tabs([
+    "⬡  WORKLOAD ORCHESTRATOR",
     "⬡  CONSTELLATION MAP",
     "⬡  PASS PREDICTIONS",
     "⬡  COST vs LATENCY",
@@ -607,6 +625,89 @@ with tab4:
     st.markdown("<div class='section-title'>YEAR-BY-YEAR PROJECTION</div>",
                 unsafe_allow_html=True)
     render_dark_table(proj_df)
+
+# ── Tab 5: Workload Orchestrator ──────────────────────────────────────────────
+with tab5:
+    st.markdown("<div class='section-title'>ORBITAL WORKLOAD SCHEDULER — "
+                f"{selected_location.upper()}</div>", unsafe_allow_html=True)
+    st.markdown(
+        "<div style='font-family:Space Mono,monospace; font-size:11px; color:#3d7a5a; "
+        "margin-bottom:12px; line-height:1.6;'>"
+        "Assigns a mock job queue to the pass windows computed in "
+        "PASS PREDICTIONS. INFERENCE jobs need one clean, uninterrupted pass. "
+        "TRAINING jobs are chunked across as many passes as needed before "
+        "their deadline — this is the actual capacity-planning problem, not "
+        "just knowing where the satellites are."
+        "</div>", unsafe_allow_html=True)
+
+    jobs = generate_job_queue(n_jobs, now_utc, seed=effective_seed)
+    schedule_df = schedule_jobs(jobs, passes_df)
+    summary = summarize_schedule(schedule_df, jobs)
+
+    s1, s2, s3, s4, s5, s6 = st.columns(6)
+    s1.metric("JOBS QUEUED", summary['total_jobs'])
+    s2.metric("FULLY SCHEDULED", summary['fully_scheduled'])
+    s3.metric("PARTIAL", summary['partial'])
+    s4.metric("UNSCHEDULED", summary['unscheduled'])
+    s5.metric("SATELLITES USED", summary['satellites_used'])
+    s6.metric("AVG WAIT (MIN)", summary['avg_wait_min'])
+
+    if passes_df.empty:
+        st.warning("NO PASS WINDOWS AVAILABLE — widen PASS WINDOW or lower MIN ELEVATION "
+                   "in the sidebar so the scheduler has capacity to assign.")
+    else:
+        placed = schedule_df[schedule_df['status'] == 'SCHEDULED'].copy()
+
+        st.markdown("<div class='section-title'>SCHEDULE — BY JOB</div>",
+                    unsafe_allow_html=True)
+        if placed.empty:
+            st.info("No jobs could be placed in the current window. Try increasing "
+                   "PASS WINDOW or lowering MIN ELEVATION in the sidebar.")
+        else:
+            placed['job_label'] = placed['job_id'] + " · " + placed['job_name']
+            fig_job_gantt = px.timeline(
+                placed, x_start='start_time', x_end='end_time',
+                y='job_label', color='job_type',
+                hover_data={'satellite': True, 'max_elevation': ':.1f',
+                            'segment_duration_min': ':.1f', 'chunk_index': True},
+                color_discrete_map={'inference': '#00ff88', 'training': '#00ccff'},
+            )
+            fig_job_gantt.update_layout(height=max(260, 22 * placed['job_label'].nunique()), **DARK)
+            fig_job_gantt.update_yaxes(autorange="reversed")
+            st.plotly_chart(fig_job_gantt, use_container_width=True)
+
+            st.markdown("<div class='section-title'>SCHEDULE — BY SATELLITE</div>",
+                        unsafe_allow_html=True)
+            fig_sat_gantt = px.timeline(
+                placed, x_start='start_time', x_end='end_time',
+                y='satellite', color='job_type',
+                hover_data={'job_id': True, 'job_name': True, 'max_elevation': ':.1f'},
+                color_discrete_map={'inference': '#00ff88', 'training': '#00ccff'},
+            )
+            fig_sat_gantt.update_layout(height=max(260, 22 * placed['satellite'].nunique()), **DARK)
+            fig_sat_gantt.update_yaxes(autorange="reversed")
+            st.plotly_chart(fig_sat_gantt, use_container_width=True)
+
+        st.markdown("<div class='section-title'>JOB QUEUE DETAIL</div>", unsafe_allow_html=True)
+        job_status = schedule_df.groupby('job_id').agg(
+            job_name=('job_name', 'first'),
+            job_type=('job_type', 'first'),
+            priority=('priority', 'first'),
+            status=('status', lambda s: 'SCHEDULED' if 'SCHEDULED' in set(s) and 'PARTIAL' not in set(s)
+                    and 'UNSCHEDULED' not in set(s) else ('PARTIAL' if 'PARTIAL' in set(s) else 'UNSCHEDULED')),
+            satellites=('satellite', lambda s: ', '.join(sorted(set(x for x in s if isinstance(x, str)))) or '—'),
+            total_scheduled_min=('segment_duration_min', 'sum'),
+        ).reset_index()
+        job_status = job_status.merge(
+            pd.DataFrame([{'job_id': j.job_id, 'required_min': j.duration_min,
+                           'deadline_hours': j.deadline_hours} for j in jobs]),
+            on='job_id'
+        )
+        job_status.columns = ['JOB ID', 'NAME', 'TYPE', 'PRIORITY', 'STATUS',
+                              'SATELLITE(S)', 'SCHEDULED (MIN)', 'REQUIRED (MIN)', 'DEADLINE (H)']
+        job_status['SCHEDULED (MIN)'] = job_status['SCHEDULED (MIN)'].apply(lambda x: f"{x:.1f}")
+        job_status['REQUIRED (MIN)'] = job_status['REQUIRED (MIN)'].apply(lambda x: f"{x:.1f}")
+        render_dark_table(job_status.sort_values('PRIORITY'))
 
 # ── Auto-refresh ──────────────────────────────────────────────────────────────
 if auto_refresh:
