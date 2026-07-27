@@ -1,0 +1,21 @@
+# Orbital Infrastructure Observability Dashboard
+# Requirements — tested on Python 3.10+
+
+# Core dashboard
+streamlit>=1.35.0
+
+# Data processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Orbital propagation (SGP4 — the accurate way)
+skyfield>=1.48
+
+# Visualization
+plotly>=5.18.0
+
+# HTTP requests (TLE fetching)
+requests>=2.31.0
+
+# Optional: faster TLE parsing
+# sgp4>=2.22  # lower-level alternative if Skyfield is too heavy
